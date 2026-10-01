@@ -18,8 +18,8 @@ function base64UrlDecode(value: string): Uint8Array<ArrayBuffer> {
   return Uint8Array.from(atob(padded), (char) => char.charCodeAt(0));
 }
 
-async function generateRsa() {
-  return crypto.subtle.generateKey(
+async function generateRsa(): Promise<CryptoKeyPair> {
+  return (await crypto.subtle.generateKey(
     {
       name: "RSASSA-PKCS1-v1_5",
       modulusLength: 2048,
@@ -28,12 +28,12 @@ async function generateRsa() {
     },
     true,
     ["sign", "verify"],
-  );
+  )) as CryptoKeyPair;
 }
 
 async function pkcs1FromGeneratedKey(privateKey: CryptoKey) {
   const pkcs8 = new Uint8Array(
-    await crypto.subtle.exportKey("pkcs8", privateKey),
+    (await crypto.subtle.exportKey("pkcs8", privateKey)) as ArrayBuffer,
   );
   return pkcs8.slice(26);
 }
