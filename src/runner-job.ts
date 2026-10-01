@@ -169,6 +169,7 @@ export class RunnerJob extends DurableObject<Env> {
   private async startRunner(): Promise<void> {
     const job = await this.load();
     if (!job || job.phase !== "dispatched") {
+      console.warn("job", job?.jobId, "not starting from phase", job?.phase);
       return;
     }
     await this.save({ ...job, phase: "starting" });
@@ -192,6 +193,12 @@ export class RunnerJob extends DurableObject<Env> {
       job.defaultBranch,
     );
     if (isForkRun(run)) {
+      console.warn(
+        "job",
+        job.jobId,
+        "rejected as a fork run",
+        JSON.stringify(run),
+      );
       await this.save({ ...job, phase: "completed", rejected: "fork" });
       return;
     }
