@@ -1,5 +1,10 @@
 FROM ghcr.io/actions/actions-runner:2.337.0
 
+ENV RUNNER_TOOL_CACHE=/opt/hostedtoolcache
+ENV AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
+
+RUN sudo mkdir -p /opt/hostedtoolcache && sudo chown runner:runner /opt/hostedtoolcache
+
 COPY --chown=runner:runner start.sh /home/runner/start.sh
 RUN chmod +x /home/runner/start.sh
 
