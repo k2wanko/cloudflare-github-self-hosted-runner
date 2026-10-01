@@ -10,6 +10,7 @@ Each job gets its own container that runs the official [`actions/runner`](https:
 2. The Worker verifies the signature, parses the `runs-on` labels and hands the job to a `RunnerJob` Durable Object.
 3. The Durable Object creates a just-in-time runner config with the GitHub App, then starts a container (restored from a snapshot when the job asks for one and it exists) that runs `./run.sh --jitconfig`.
 4. The runner takes exactly one job and exits. `workflow_job` (`completed`) tears the container down and publishes the snapshot the job took.
+5. While the container runs, the Durable Object asks GitHub for the job's status every five minutes. This is the safety net against orphaned containers (see [Orphan check](#orphan-check)).
 
 ## Deploy
 
@@ -170,12 +171,24 @@ jobs:
 - `docker` adds the daemon's memory use, so use `standard-2` or larger.
 - Job containers (`container:`) and Docker Compose have not been tested.
 
+## Orphan check
+
+A container is billed while it runs, so every `RunnerJob` Durable Object checks its job on GitHub every five minutes:
+
+- The job the runner took is still running: nothing happens.
+- The job finished (or was cancelled before it was assigned): the container is destroyed and the job's snapshot is published or discarded. This also recovers from a missed `workflow_job.completed` webhook.
+- The runner has not taken any job for 15 minutes: the container is destroyed and the runner registration is removed.
+- GitHub cannot be reached: the check is retried five minutes later and nothing is destroyed.
+
+The record of a finished job is kept for 24 hours, so a redelivered `queued` webhook does not start a second runner, and is then deleted together with its alarm.
+
 ## Limits and notes
 
 - Jobs may run for at most 6 hours.
 - Pull requests from forks are not supported; their jobs are ignored and stay queued.
 - Containers run as the `runner` user of the official `actions-runner` image (Ubuntu). It does not include the tool set of GitHub-hosted runners; use `setup-*` actions, optionally with a snapshot.
 - If the container cannot start, the job stays queued and the failure is written to the Worker logs. There is no automatic retry.
+- If GitHub never sends the `queued` webhook for a job, nothing starts it. Re-run the job.
 - Update the runner by changing the version in `images/default/Dockerfile`. GitHub stops serving jobs to runners that are more than 30 days behind.
 
 ## Troubleshooting
