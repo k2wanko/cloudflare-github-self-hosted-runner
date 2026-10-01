@@ -11,8 +11,14 @@ interface WorkflowJobPayload {
     run_attempt: number;
     labels: string[];
     runner_name: string | null;
+    conclusion: string | null;
   };
-  repository: { name: string; owner: { login: string; type: string } };
+  repository: {
+    name: string;
+    full_name: string;
+    default_branch: string;
+    owner: { login: string; type: string };
+  };
   installation?: { id: number };
 }
 
@@ -76,11 +82,15 @@ export async function handleWebhook(
       ownerLogin: owner.login,
       ownerIsOrg: owner.type === "Organization",
       repo: payload.repository.name,
+      repositoryFullName: payload.repository.full_name,
+      defaultBranch: payload.repository.default_branch,
+      runId: job.run_id,
       jobId: job.id,
       attempt: job.run_attempt,
       labels: job.labels,
       image: parsed.image ?? "default",
       instance: parsed.instance,
+      snapshot: parsed.snapshot,
     });
     return json({ dispatch: result });
   }
@@ -92,11 +102,13 @@ export async function handleWebhook(
   }
   if (payload.action === "completed") {
     if (targetJobId !== undefined) {
-      await jobs.getByName(String(targetJobId)).markCompleted();
+      await jobs.getByName(String(targetJobId)).markCompleted(job.conclusion);
       return json({ completed: targetJobId });
     }
     if (job.runner_name === null) {
-      await jobs.getByName(String(job.id)).markCancelledBeforeAssignment();
+      await jobs
+        .getByName(String(job.id))
+        .markCompleted(job.conclusion ?? "cancelled");
       return json({ cancelled: job.id });
     }
   }

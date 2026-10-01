@@ -8,12 +8,19 @@ export interface JobRecord {
   ownerLogin: string;
   ownerIsOrg: boolean;
   repo: string;
+  repositoryFullName: string;
+  defaultBranch: string;
+  runId: number;
   jobId: number;
   attempt: number;
   labels: string[];
   image: string;
   instance: InstanceSpec;
+  snapshot?: string;
+  imageRef?: string;
+  allowCreate?: boolean;
   runnerId?: number;
+  rejected?: string;
 }
 
 export const RUNNER_NAME_PREFIX = "cf-";

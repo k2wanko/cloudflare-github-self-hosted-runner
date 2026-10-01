@@ -10,11 +10,27 @@ import {
   type RunnerScope,
 } from "./github/jit.ts";
 import { type JobRecord, runnerNameFor } from "./job-state.ts";
+import {
+  canCreateSnapshot,
+  canRestoreSnapshot,
+  isForkRun,
+  isRestoreNotFound,
+  type WorkflowRunInfo,
+} from "./snapshot-policy.ts";
+import type { SnapshotHandle } from "./snapshot-registry.ts";
 
 const JOB_TIME_LIMIT_MS = 6 * 60 * 60 * 1000;
+const RESTORE_CHECK_MS = 4000;
 const API_OPTIONS: GitHubApiOptions = { userAgent: "cfrunner" };
 
-export type DispatchInput = Omit<JobRecord, "phase" | "runnerId">;
+export type DispatchInput = Omit<JobRecord, "phase" | "runnerId" | "rejected">;
+
+export interface SnapshotResponse {
+  status: number;
+  body: Record<string, string | number | boolean>;
+}
+
+type ContainerHandle = NonNullable<DurableObjectState["container"]>;
 
 function scopeOf(job: JobRecord): RunnerScope {
   return job.ownerIsOrg
@@ -22,23 +38,63 @@ function scopeOf(job: JobRecord): RunnerScope {
     : { kind: "repo", owner: job.ownerLogin, repo: job.repo };
 }
 
+function imageRefOf(image: unknown): string {
+  return JSON.stringify(image) ?? String(image);
+}
+
+async function fetchRunInfo(
+  token: string,
+  job: JobRecord,
+): Promise<WorkflowRunInfo> {
+  const response = await fetch(
+    `https://api.github.com/repos/${job.repositoryFullName}/actions/runs/${job.runId}`,
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github+json",
+        "User-Agent": API_OPTIONS.userAgent,
+      },
+    },
+  );
+  if (!response.ok) {
+    throw new Error(`workflow run lookup failed: ${response.status}`);
+  }
+  const run = (await response.json()) as {
+    event: string;
+    head_branch: string | null;
+    head_repository: { full_name: string } | null;
+  };
+  return {
+    event: run.event,
+    headBranch: run.head_branch,
+    headRepositoryFullName: run.head_repository?.full_name ?? null,
+    repositoryFullName: job.repositoryFullName,
+    defaultBranch: job.defaultBranch,
+  };
+}
+
 export class RunnerJob extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
-      if (ctx.container?.running) {
-        await ctx.container.setInactivityTimeout(JOB_TIME_LIMIT_MS);
-        this.watchContainer();
+      const job = await this.load();
+      if (job && ctx.container?.running) {
+        await this.armContainer(ctx.container, job);
       }
     });
   }
 
-  private get container(): NonNullable<DurableObjectState["container"]> {
+  private get container(): ContainerHandle {
     const container = this.ctx.container;
     if (!container) {
       throw new Error("container is not available");
     }
     return container;
+  }
+
+  private registry() {
+    return (job: JobRecord) =>
+      this.ctx.exports.SnapshotRegistry.getByName(job.repositoryFullName);
   }
 
   private async load(): Promise<JobRecord | undefined> {
@@ -47,6 +103,17 @@ export class RunnerJob extends DurableObject<Env> {
 
   private async save(job: JobRecord): Promise<void> {
     await this.ctx.storage.put("job", job);
+  }
+
+  private async armContainer(
+    container: ContainerHandle,
+    job: JobRecord,
+  ): Promise<void> {
+    await container.setInactivityTimeout(JOB_TIME_LIMIT_MS);
+    await container.interceptOutboundHttp(
+      this.env.INTERNAL_HOST,
+      this.ctx.exports.Control({ props: { jobId: job.jobId } }),
+    );
   }
 
   async dispatch(input: DispatchInput): Promise<"accepted" | "duplicate"> {
@@ -65,28 +132,68 @@ export class RunnerJob extends DurableObject<Env> {
     }
   }
 
-  async markCompleted(): Promise<void> {
+  async markCompleted(conclusion: string | null): Promise<void> {
     const job = await this.load();
     if (!job || job.phase === "completed") {
       return;
     }
     await this.save({ ...job, phase: "completed" });
+    await this.registry()(job).promote(job.jobId, conclusion === "success");
     if (this.container.running) {
       await this.container.destroy("job completed");
     }
   }
 
-  async markCancelledBeforeAssignment(): Promise<void> {
-    await this.markCompleted();
-  }
+  async createSnapshot(): Promise<SnapshotResponse> {
+    const job = await this.load();
+    if (!job || (job.phase !== "starting" && job.phase !== "started")) {
+      return { status: 409, body: { error: "job is not running" } };
+    }
+    if (!job.snapshot || !job.imageRef) {
+      return { status: 400, body: { error: "no snapshot label on this job" } };
+    }
+    if (!job.allowCreate) {
+      return {
+        status: 403,
+        body: { error: "snapshots can only be created from allowed refs" },
+      };
+    }
 
-  private watchContainer(): void {
-    this.ctx.waitUntil(
-      this.container
-        .monitor()
-        .catch(() => undefined)
-        .then(() => this.container.destroy("container exited")),
+    const registry = this.registry()(job);
+    const reserved = await registry.reserve(
+      job.snapshot,
+      job.imageRef,
+      job.jobId,
     );
+    if (reserved !== "reserved") {
+      return {
+        status: 200,
+        body: { created: false, reason: reserved, name: job.snapshot },
+      };
+    }
+
+    try {
+      const handle = await this.container.snapshotContainer({
+        name: job.snapshot,
+      });
+      await registry.attach(job.snapshot, job.imageRef, job.jobId, {
+        id: handle.id,
+        size: handle.size,
+        name: job.snapshot,
+      });
+      return {
+        status: 200,
+        body: {
+          created: true,
+          name: job.snapshot,
+          size: handle.size,
+          availableAfterJobCompletes: true,
+        },
+      };
+    } catch (error) {
+      await registry.abandon(job.snapshot, job.imageRef, job.jobId);
+      return { status: 500, body: { error: String(error) } };
+    }
   }
 
   private async startRunner(): Promise<void> {
@@ -108,11 +215,29 @@ export class RunnerJob extends DurableObject<Env> {
       job.installationId,
       API_OPTIONS,
     );
-    const runnerName = runnerNameFor(job.jobId, job.attempt);
+
+    const run = await fetchRunInfo(token, job);
+    if (isForkRun(run)) {
+      await this.save({ ...job, phase: "completed", rejected: "fork" });
+      return;
+    }
+
+    const images = this.container.images as Record<string, unknown>;
+    const image = images[job.image];
+    if (!image) {
+      throw new Error(`unknown image: ${job.image}`);
+    }
+    const imageRef = imageRefOf(image);
+    const allowCreate = canCreateSnapshot(run);
+    const allowRestore = canRestoreSnapshot(
+      run,
+      this.env.SNAPSHOT_RESTORE_ANY_REF === "true",
+    );
+
     const jit = await generateJitConfig(
       token,
       scopeOf(job),
-      runnerName,
+      runnerNameFor(job.jobId, job.attempt),
       job.labels,
       API_OPTIONS,
     );
@@ -122,21 +247,69 @@ export class RunnerJob extends DurableObject<Env> {
       await deleteRunner(token, scopeOf(job), jit.runnerId, API_OPTIONS);
       return;
     }
-    await this.save({ ...latest, phase: "starting", runnerId: jit.runnerId });
+    await this.save({
+      ...latest,
+      phase: "starting",
+      runnerId: jit.runnerId,
+      imageRef,
+      allowCreate,
+    });
 
-    const images = this.container.images as Record<string, unknown>;
-    const image = images[job.image];
-    if (!image) {
-      throw new Error(`unknown image: ${job.image}`);
+    let handle: SnapshotHandle | null = null;
+    if (job.snapshot && allowRestore) {
+      handle = await this.registry()(job).resolve(job.snapshot, imageRef);
     }
 
-    this.container.start({
-      image: image as never,
+    const started = await this.startContainer(
+      latest,
+      image,
+      jit.encodedJitConfig,
+      handle,
+    );
+    if (started === "restore-not-found" && handle) {
+      await this.registry()(job).restoreFailed(handle.id);
+      await this.startContainer(latest, image, jit.encodedJitConfig, null);
+    }
+  }
+
+  private async startContainer(
+    job: JobRecord,
+    image: unknown,
+    jitConfig: string,
+    snapshot: SnapshotHandle | null,
+  ): Promise<"ok" | "restore-not-found"> {
+    const container = this.container;
+    container.start({
+      ...(snapshot
+        ? { containerSnapshot: snapshot }
+        : { image: image as never }),
       instance: job.instance,
       enableInternet: true,
-      env: { JITCONFIG: jit.encodedJitConfig },
+      env: {
+        JITCONFIG: jitConfig,
+        CFRUNNER_ENDPOINT: `http://${this.env.INTERNAL_HOST}`,
+        CFRUNNER_SNAPSHOT_HIT: snapshot ? "true" : "false",
+      },
     });
-    await this.container.setInactivityTimeout(JOB_TIME_LIMIT_MS);
-    this.watchContainer();
+    await this.armContainer(container, job);
+
+    const exit = container.monitor().then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    this.ctx.waitUntil(exit.then(() => container.destroy("container exited")));
+
+    if (!snapshot) {
+      return "ok";
+    }
+    const early = await Promise.race([
+      exit,
+      new Promise<undefined>((resolve) =>
+        setTimeout(() => resolve(undefined), RESTORE_CHECK_MS),
+      ),
+    ]);
+    return early !== undefined && isRestoreNotFound(early)
+      ? "restore-not-found"
+      : "ok";
   }
 }

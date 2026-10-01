@@ -1,0 +1,202 @@
+import { DurableObject } from "cloudflare:workers";
+import { isExpired, isStalePending } from "./snapshot-policy.ts";
+
+export interface SnapshotHandle {
+  id: string;
+  size: number;
+  name: string;
+}
+
+export type ReserveResult = "reserved" | "exists" | "pending";
+
+const DELETED_ROW_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
+
+type DeleteReason =
+  | "job_failed"
+  | "restore_failed"
+  | "expired"
+  | "superseded"
+  | "stale_pending";
+
+export class SnapshotRegistry extends DurableObject {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS snapshots (
+        row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        image_ref TEXT NOT NULL,
+        state TEXT NOT NULL,
+        job_id INTEGER NOT NULL,
+        snapshot_id TEXT,
+        size INTEGER,
+        snapshot_name TEXT,
+        created_at INTEGER NOT NULL,
+        last_used_at INTEGER NOT NULL,
+        deleted_at INTEGER,
+        reason TEXT
+      )
+    `);
+  }
+
+  private markDeleted(rowId: number, reason: DeleteReason, now: number): void {
+    this.ctx.storage.sql.exec(
+      "UPDATE snapshots SET state = 'deleted', deleted_at = ?, reason = ? WHERE row_id = ?",
+      now,
+      reason,
+      rowId,
+    );
+  }
+
+  private purgeOldDeletedRows(now: number): void {
+    this.ctx.storage.sql.exec(
+      "DELETE FROM snapshots WHERE state = 'deleted' AND deleted_at < ?",
+      now - DELETED_ROW_RETENTION_MS,
+    );
+  }
+
+  reserve(name: string, imageRef: string, jobId: number): ReserveResult {
+    const now = Date.now();
+    this.purgeOldDeletedRows(now);
+
+    const existing = this.ctx.storage.sql
+      .exec<{ row_id: number; state: string; created_at: number }>(
+        "SELECT row_id, state, created_at FROM snapshots WHERE name = ? AND image_ref = ? AND state IN ('ready', 'pending')",
+        name,
+        imageRef,
+      )
+      .toArray();
+
+    for (const row of existing) {
+      if (row.state === "ready") {
+        return "exists";
+      }
+      if (!isStalePending(row.created_at, now)) {
+        return "pending";
+      }
+      this.markDeleted(row.row_id, "stale_pending", now);
+    }
+
+    this.ctx.storage.sql.exec(
+      "INSERT INTO snapshots (name, image_ref, state, job_id, created_at, last_used_at) VALUES (?, ?, 'pending', ?, ?, ?)",
+      name,
+      imageRef,
+      jobId,
+      now,
+      now,
+    );
+    return "reserved";
+  }
+
+  attach(
+    name: string,
+    imageRef: string,
+    jobId: number,
+    handle: SnapshotHandle,
+  ): void {
+    this.ctx.storage.sql.exec(
+      "UPDATE snapshots SET snapshot_id = ?, size = ?, snapshot_name = ? WHERE name = ? AND image_ref = ? AND job_id = ? AND state = 'pending'",
+      handle.id,
+      handle.size,
+      handle.name,
+      name,
+      imageRef,
+      jobId,
+    );
+  }
+
+  abandon(name: string, imageRef: string, jobId: number): void {
+    this.ctx.storage.sql.exec(
+      "UPDATE snapshots SET state = 'deleted', deleted_at = ?, reason = 'job_failed' WHERE name = ? AND image_ref = ? AND job_id = ? AND state = 'pending'",
+      Date.now(),
+      name,
+      imageRef,
+      jobId,
+    );
+  }
+
+  promote(jobId: number, succeeded: boolean): void {
+    const now = Date.now();
+    const rows = this.ctx.storage.sql
+      .exec<{
+        row_id: number;
+        name: string;
+        image_ref: string;
+        snapshot_id: string | null;
+      }>(
+        "SELECT row_id, name, image_ref, snapshot_id FROM snapshots WHERE job_id = ? AND state = 'pending'",
+        jobId,
+      )
+      .toArray();
+
+    for (const row of rows) {
+      if (!succeeded || row.snapshot_id === null) {
+        this.markDeleted(row.row_id, "job_failed", now);
+        continue;
+      }
+      const older = this.ctx.storage.sql
+        .exec<{ row_id: number }>(
+          "SELECT row_id FROM snapshots WHERE name = ? AND image_ref = ? AND state = 'ready'",
+          row.name,
+          row.image_ref,
+        )
+        .toArray();
+      for (const previous of older) {
+        this.markDeleted(previous.row_id, "superseded", now);
+      }
+      this.ctx.storage.sql.exec(
+        "UPDATE snapshots SET state = 'ready', last_used_at = ? WHERE row_id = ?",
+        now,
+        row.row_id,
+      );
+    }
+  }
+
+  resolve(name: string, imageRef: string): SnapshotHandle | null {
+    const now = Date.now();
+    const rows = this.ctx.storage.sql
+      .exec<{
+        row_id: number;
+        snapshot_id: string;
+        size: number;
+        snapshot_name: string;
+        last_used_at: number;
+      }>(
+        "SELECT row_id, snapshot_id, size, snapshot_name, last_used_at FROM snapshots WHERE name = ? AND image_ref = ? AND state = 'ready' ORDER BY row_id DESC LIMIT 1",
+        name,
+        imageRef,
+      )
+      .toArray();
+    const row = rows[0];
+    if (!row) {
+      return null;
+    }
+    if (isExpired(row.last_used_at, now)) {
+      this.markDeleted(row.row_id, "expired", now);
+      return null;
+    }
+    this.ctx.storage.sql.exec(
+      "UPDATE snapshots SET last_used_at = ? WHERE row_id = ?",
+      now,
+      row.row_id,
+    );
+    return { id: row.snapshot_id, size: row.size, name: row.snapshot_name };
+  }
+
+  restoreFailed(snapshotId: string): void {
+    const now = Date.now();
+    this.ctx.storage.sql.exec(
+      "UPDATE snapshots SET state = 'deleted', deleted_at = ?, reason = 'restore_failed' WHERE snapshot_id = ? AND state = 'ready'",
+      now,
+      snapshotId,
+    );
+  }
+
+  list(): Array<Record<string, unknown>> {
+    return this.ctx.storage.sql
+      .exec(
+        "SELECT name, state, job_id, snapshot_id, size, created_at, last_used_at, deleted_at, reason FROM snapshots ORDER BY row_id DESC LIMIT 50",
+      )
+      .toArray();
+  }
+}

@@ -13,8 +13,10 @@ import {
 } from "./setup/page.ts";
 import { handleWebhook } from "./webhook.ts";
 
+export { Control } from "./control.ts";
 export { RunnerJob } from "./runner-job.ts";
 export { Setup } from "./setup/setup-do.ts";
+export { SnapshotRegistry } from "./snapshot-registry.ts";
 
 const USER_AGENT = "cfrunner";
 
