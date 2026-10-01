@@ -5,8 +5,14 @@ import {
   generateJitConfig,
   type RunnerScope,
 } from "./github/jit.ts";
+import { fetchRunJobs } from "./github/run-jobs.ts";
 import { fetchWorkflowRun } from "./github/workflow-run.ts";
 import { type JobRecord, runnerNameFor } from "./job-state.ts";
+import {
+  JOB_RECORD_RETENTION_MS,
+  judgeRunnerJob,
+  ORPHAN_CHECK_INTERVAL_MS,
+} from "./orphan.ts";
 import { SETUP_INSTANCE } from "./setup/setup-do.ts";
 import {
   canCreateSnapshot,
@@ -98,7 +104,7 @@ export class RunnerJob extends DurableObject<Env> {
       return;
     }
     if (job.phase !== "completed") {
-      await this.save({ ...job, phase: "completed" });
+      await this.finish(job);
     }
     await Promise.all([
       this.registry(job).promote(job.jobId, conclusion === "success"),
@@ -150,6 +156,73 @@ export class RunnerJob extends DurableObject<Env> {
     }
   }
 
+  private async finish(job: JobRecord, rejected?: string): Promise<void> {
+    await this.save({ ...job, phase: "completed", rejected });
+    await this.ctx.storage.setAlarm(Date.now() + JOB_RECORD_RETENTION_MS);
+  }
+
+  private async installationToken(job: JobRecord): Promise<string> {
+    const credentials =
+      await this.ctx.exports.Setup.getByName(SETUP_INSTANCE).getCredentials();
+    if (!credentials) {
+      throw new Error("setup is not completed");
+    }
+    return getInstallationToken(
+      await createAppJwt(credentials.appId, credentials.pem),
+      job.installationId,
+    );
+  }
+
+  async alarm(): Promise<void> {
+    const job = await this.load();
+    if (!job) {
+      return;
+    }
+    if (job.phase === "completed") {
+      if (this.container.running) {
+        await this.container.destroy("job already completed");
+      }
+      console.log("job", job.jobId, "record deleted");
+      await this.ctx.storage.deleteAll();
+      return;
+    }
+
+    try {
+      const token = await this.installationToken(job);
+      const verdict = judgeRunnerJob(
+        await fetchRunJobs(
+          token,
+          job.repositoryFullName,
+          job.runId,
+          job.attempt,
+        ),
+        {
+          runnerName: runnerNameFor(job.jobId, job.attempt),
+          jobId: job.jobId,
+          startedAt: job.containerStartedAt ?? Date.now(),
+          now: Date.now(),
+        },
+      );
+      console.log("job", job.jobId, "orphan check", verdict.kind);
+      if (verdict.kind === "finished") {
+        await this.markCompleted(verdict.conclusion);
+        return;
+      }
+      if (verdict.kind === "unassigned") {
+        await this.markCompleted(null);
+        if (job.runnerId !== undefined) {
+          await deleteRunner(token, scopeOf(job), job.runnerId).catch(
+            () => undefined,
+          );
+        }
+        return;
+      }
+    } catch (error) {
+      console.error("orphan check failed", job.jobId, String(error));
+    }
+    await this.ctx.storage.setAlarm(Date.now() + ORPHAN_CHECK_INTERVAL_MS);
+  }
+
   private async startRunnerOrFail(): Promise<void> {
     try {
       await this.startRunner();
@@ -157,11 +230,7 @@ export class RunnerJob extends DurableObject<Env> {
       const job = await this.load();
       console.error("runner start failed", job?.jobId, String(error));
       if (job) {
-        await this.save({
-          ...job,
-          phase: "completed",
-          rejected: String(error),
-        });
+        await this.finish(job, String(error));
       }
     }
   }
@@ -174,16 +243,7 @@ export class RunnerJob extends DurableObject<Env> {
     }
     await this.save({ ...job, phase: "starting" });
 
-    const credentials =
-      await this.ctx.exports.Setup.getByName(SETUP_INSTANCE).getCredentials();
-    if (!credentials) {
-      throw new Error("setup is not completed");
-    }
-
-    const token = await getInstallationToken(
-      await createAppJwt(credentials.appId, credentials.pem),
-      job.installationId,
-    );
+    const token = await this.installationToken(job);
 
     console.log("job", job.jobId, "fetching run info");
     const run = await fetchWorkflowRun(
@@ -199,7 +259,7 @@ export class RunnerJob extends DurableObject<Env> {
         "rejected as a fork run",
         JSON.stringify(run),
       );
-      await this.save({ ...job, phase: "completed", rejected: "fork" });
+      await this.finish(job, "fork");
       return;
     }
 
@@ -243,6 +303,8 @@ export class RunnerJob extends DurableObject<Env> {
         ...latest,
         imageRef: image,
         allowCreate: canCreateSnapshot(run),
+        runnerId: jit.runnerId,
+        containerStartedAt: Date.now(),
       });
 
       console.log("job", job.jobId, "starting container");
@@ -284,6 +346,7 @@ export class RunnerJob extends DurableObject<Env> {
       },
     });
     await this.prepareRunningContainer(container, job);
+    await this.ctx.storage.setAlarm(Date.now() + ORPHAN_CHECK_INTERVAL_MS);
 
     const exit = container.monitor().then(
       () => undefined,

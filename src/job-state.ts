@@ -21,6 +21,8 @@ export interface JobRecord {
   imageRef?: string;
   allowCreate?: boolean;
   rejected?: string;
+  runnerId?: number;
+  containerStartedAt?: number;
 }
 
 const RUNNER_NAME_PREFIX = "cf-";
