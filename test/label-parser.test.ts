@@ -33,11 +33,14 @@ describe("parseLabels", () => {
     expect(result).toMatchObject({ matched: true, instance: "standard-2" });
   });
 
-  test("rejects basic, which the runtime does not accept", () => {
-    const result = parseLabels([jobLabel, "instance:basic"], context);
-    expect(result).toMatchObject({ matched: true });
-    expect("error" in result && result.error).toBeTruthy();
-  });
+  test.each(["basic", "lite"])(
+    "rejects %s, which cannot run the runner",
+    (preset) => {
+      const result = parseLabels([jobLabel, `instance:${preset}`], context);
+      expect(result).toMatchObject({ matched: true });
+      expect("error" in result && result.error).toBeTruthy();
+    },
+  );
 
   test("parses a custom instance", () => {
     const result = parseLabels(

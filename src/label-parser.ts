@@ -1,5 +1,4 @@
 export const INSTANCE_PRESETS = [
-  "lite",
   "standard-1",
   "standard-2",
   "standard-3",

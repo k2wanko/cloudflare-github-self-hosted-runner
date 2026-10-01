@@ -55,7 +55,7 @@ jobs:
 | Label | Meaning |
 |---|---|
 | `<prefix>-<run_id>-<run_attempt>` | Required. Selects this runner. |
-| `instance:<preset>` | `lite`, `standard-1` (default), `standard-2`, `standard-3`, `standard-4`. |
+| `instance:<preset>` | `standard-1` (default), `standard-2`, `standard-3`, `standard-4`. `lite` is not supported: the container does not start with this image. |
 | `instance:cpu=2,memory=6,disk=16` | Custom size: 1–4 vCPU, memory in GiB (at least 3 GiB per vCPU, at most 12), disk in GB (at most 20). |
 | `image:<name>` | Image defined in `cloudflare.config.ts` (default `default`). |
 | `snapshot:<name>` | Restore this snapshot when it exists, otherwise start from the image. |
