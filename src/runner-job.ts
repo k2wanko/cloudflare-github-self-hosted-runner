@@ -236,6 +236,7 @@ export class RunnerJob extends DurableObject<Env> {
 
     cleanup.token = token;
 
+    console.log("job", job.jobId, "fetching run info");
     const run = await fetchRunInfo(token, job);
     if (isForkRun(run)) {
       await this.save({ ...job, phase: "completed", rejected: "fork" });
@@ -254,6 +255,7 @@ export class RunnerJob extends DurableObject<Env> {
       this.env.SNAPSHOT_RESTORE_ANY_REF === "true",
     );
 
+    console.log("job", job.jobId, "creating jit config");
     const jit = await generateJitConfig(
       token,
       scopeOf(job),
@@ -280,8 +282,16 @@ export class RunnerJob extends DurableObject<Env> {
     let handle: SnapshotHandle | null = null;
     if (job.snapshot && allowRestore) {
       handle = await this.registry()(job).resolve(job.snapshot, imageRef);
+      console.log(
+        "job",
+        job.jobId,
+        "snapshot",
+        job.snapshot,
+        handle ? "hit" : "miss",
+      );
     }
 
+    console.log("job", job.jobId, "starting container");
     const started = await this.startContainer(
       latest,
       image,
@@ -319,7 +329,18 @@ export class RunnerJob extends DurableObject<Env> {
       () => undefined,
       (error: unknown) => error,
     );
-    this.ctx.waitUntil(exit.then(() => container.destroy("container exited")));
+    const startedAt = Date.now();
+    this.ctx.waitUntil(
+      exit.then(async (reason) => {
+        console.log(
+          "container exited",
+          job.jobId,
+          `after ${Date.now() - startedAt}ms`,
+          reason === undefined ? "cleanly" : String(reason),
+        );
+        await container.destroy("container exited").catch(() => undefined);
+      }),
+    );
 
     if (!snapshot) {
       return "ok";
