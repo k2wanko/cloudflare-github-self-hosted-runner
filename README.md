@@ -62,6 +62,7 @@ jobs:
 | `instance:cpu=2,memory=6,disk=16` | Custom size: 1–4 vCPU, memory in GiB (at least 3 GiB per vCPU, at most 12), disk in GB (at most 20). |
 | `image:<name>` | Image defined in `cloudflare.config.ts` (default `default`). |
 | `snapshot:<name>` | Restore this snapshot when it exists, otherwise start from the image. |
+| `docker` | Start a Docker daemon before the runner starts (see [Docker](#docker)). |
 
 Preset sizes:
 
@@ -137,13 +138,44 @@ Anything under the runner's `_work` directory (the checkout) is deleted when a s
 - **Fallback.** If a requested snapshot does not exist or cannot be restored, the job starts from the image and `CFRUNNER_SNAPSHOT_HIT` is `false`.
 - **Secrets.** Anything on disk when the snapshot is taken reaches later jobs. Do not write secrets to files before taking it, and use `persist-credentials: false` for checkout. A snapshot cannot be deleted from the platform; it is only marked unusable, so rotate any secret that leaked into one.
 
+## Docker
+
+Add the `docker` label and the container starts `dockerd` before the runner, so `docker`, `services:` and `docker build` work in the job.
+
+```yaml
+jobs:
+  bench:
+    runs-on:
+      - cfrunner-${{ github.run_id }}-${{ github.run_attempt }}
+      - instance:standard-3
+      - docker
+      - snapshot:pg16-v1
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: pw
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+    steps:
+      - run: docker run --rm --network host -e PGPASSWORD=pw postgres:16-alpine pgbench -i -s 10 -h 127.0.0.1 -U postgres postgres
+      - run: curl -fsS -X POST "$CFRUNNER_ENDPOINT/snapshot" || true
+```
+
+- The container is a microVM where `/proc/sys` is read-only. The start script remounts it read-write and enables IPv4 forwarding, then starts `dockerd` with `iptables` (installed in the image). Bridge networks, published ports, container-to-container name resolution and outbound access from containers were verified.
+- The Docker data directory is part of a snapshot, so images pulled before the snapshot is taken are available without pulling again. In a measured run with `postgres:16-alpine`, starting the service took 8 s instead of 17 s and the whole job 44–46 s instead of 58 s. The first restore of a large snapshot (479 MB) was slower than the following ones.
+- `docker` adds the daemon's memory use, so use `standard-2` or larger.
+- Job containers (`container:`) and Docker Compose have not been tested.
+
 ## Limits and notes
 
 - Jobs may run for at most 6 hours.
 - Pull requests from forks are not supported; their jobs are ignored and stay queued.
 - Containers run as the `runner` user of the official `actions-runner` image (Ubuntu). It does not include the tool set of GitHub-hosted runners; use `setup-*` actions, optionally with a snapshot.
 - If the container cannot start, the job stays queued and the failure is written to the Worker logs. There is no automatic retry.
-- Docker-in-Docker and service containers have not been tested.
 - Update the runner by changing the version in `images/default/Dockerfile`. GitHub stops serving jobs to runners that are more than 30 days behind.
 
 ## Troubleshooting

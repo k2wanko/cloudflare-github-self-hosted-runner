@@ -40,6 +40,7 @@ type ParsedLabels =
       image?: string;
       instance: InstanceSpec;
       snapshot?: string;
+      docker: boolean;
     };
 
 const SNAPSHOT_NAME = /^[A-Za-z0-9._-]{1,64}$/;
@@ -114,9 +115,12 @@ export function parseLabels(
   let image: string | undefined;
   let instance: InstanceSpec | undefined;
   let snapshot: string | undefined;
+  let docker = false;
 
   for (const label of labels) {
-    if (label.startsWith("image:")) {
+    if (label === "docker") {
+      docker = true;
+    } else if (label.startsWith("image:")) {
       if (image !== undefined) {
         return { matched: true, error: "duplicate image label" };
       }
@@ -154,5 +158,6 @@ export function parseLabels(
     image,
     instance: instance ?? DEFAULT_INSTANCE,
     snapshot,
+    docker,
   };
 }

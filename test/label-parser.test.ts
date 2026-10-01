@@ -17,7 +17,16 @@ describe("parseLabels", () => {
       image: undefined,
       instance: "standard-1",
       snapshot: undefined,
+      docker: false,
     });
+  });
+
+  test("parses the docker flag", () => {
+    expect(parseLabels([jobLabel, "docker"], context)).toMatchObject({
+      matched: true,
+      docker: true,
+    });
+    expect(parseLabels([jobLabel], context)).toMatchObject({ docker: false });
   });
 
   test("rejects a job label for another run", () => {

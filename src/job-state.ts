@@ -17,6 +17,7 @@ export interface JobRecord {
   image: string;
   instance: InstanceSpec;
   snapshot?: string;
+  docker: boolean;
   imageRef?: string;
   allowCreate?: boolean;
   rejected?: string;

@@ -93,6 +93,7 @@ export async function handleWebhook(
       image: parsed.image ?? "default",
       instance: parsed.instance,
       snapshot: parsed.snapshot,
+      docker: parsed.docker,
     });
     return json({ dispatch: result });
   }

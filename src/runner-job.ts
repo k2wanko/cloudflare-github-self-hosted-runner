@@ -273,6 +273,7 @@ export class RunnerJob extends DurableObject<Env> {
         JITCONFIG: jitConfig,
         CFRUNNER_ENDPOINT: `http://${this.env.INTERNAL_HOST}`,
         CFRUNNER_SNAPSHOT_HIT: snapshot ? "true" : "false",
+        CFRUNNER_DOCKER: job.docker ? "true" : "false",
       },
     });
     await this.prepareRunningContainer(container, job);
