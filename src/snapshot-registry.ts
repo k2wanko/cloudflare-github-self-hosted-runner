@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { isExpired, isStalePending } from "./snapshot-policy.ts";
+import { isExpired, PENDING_RESERVATION_TTL_MS } from "./snapshot-policy.ts";
 
 export interface SnapshotHandle {
   id: string;
@@ -28,7 +28,6 @@ export class SnapshotRegistry extends DurableObject {
         job_id INTEGER NOT NULL,
         snapshot_id TEXT,
         size INTEGER,
-        snapshot_name TEXT,
         created_at INTEGER NOT NULL,
         last_used_at INTEGER NOT NULL,
         deleted_at INTEGER,
@@ -57,16 +56,11 @@ export class SnapshotRegistry extends DurableObject {
     const now = Date.now();
     this.purgeOldDeletedRows(now);
 
-    const stale = this.ctx.storage.sql
-      .exec<{ row_id: number; created_at: number }>(
-        "SELECT row_id, created_at FROM snapshots WHERE state = 'pending'",
-      )
-      .toArray();
-    for (const row of stale) {
-      if (isStalePending(row.created_at, now)) {
-        this.markDeleted(row.row_id, "stale_pending", now);
-      }
-    }
+    this.ctx.storage.sql.exec(
+      "UPDATE snapshots SET state = 'deleted', deleted_at = ?, reason = 'stale_pending' WHERE state = 'pending' AND created_at < ?",
+      now,
+      now - PENDING_RESERVATION_TTL_MS,
+    );
 
     this.ctx.storage.sql.exec(
       "INSERT INTO snapshots (name, image_ref, state, job_id, created_at, last_used_at) VALUES (?, ?, 'pending', ?, ?, ?)",
@@ -85,10 +79,9 @@ export class SnapshotRegistry extends DurableObject {
     handle: SnapshotHandle,
   ): void {
     this.ctx.storage.sql.exec(
-      "UPDATE snapshots SET snapshot_id = ?, size = ?, snapshot_name = ? WHERE row_id = (SELECT MAX(row_id) FROM snapshots WHERE name = ? AND image_ref = ? AND job_id = ? AND state = 'pending')",
+      "UPDATE snapshots SET snapshot_id = ?, size = ? WHERE row_id = (SELECT MAX(row_id) FROM snapshots WHERE name = ? AND image_ref = ? AND job_id = ? AND state = 'pending')",
       handle.id,
       handle.size,
-      handle.name,
       name,
       imageRef,
       jobId,
@@ -125,8 +118,8 @@ export class SnapshotRegistry extends DurableObject {
         continue;
       }
       const newer = this.ctx.storage.sql
-        .exec<{ row_id: number }>(
-          "SELECT row_id FROM snapshots WHERE name = ? AND image_ref = ? AND state = 'ready' AND row_id > ?",
+        .exec(
+          "SELECT 1 FROM snapshots WHERE name = ? AND image_ref = ? AND state = 'ready' AND row_id > ? LIMIT 1",
           row.name,
           row.image_ref,
           row.row_id,
@@ -136,17 +129,13 @@ export class SnapshotRegistry extends DurableObject {
         this.markDeleted(row.row_id, "superseded", now);
         continue;
       }
-      const older = this.ctx.storage.sql
-        .exec<{ row_id: number }>(
-          "SELECT row_id FROM snapshots WHERE name = ? AND image_ref = ? AND state = 'ready' AND row_id < ?",
-          row.name,
-          row.image_ref,
-          row.row_id,
-        )
-        .toArray();
-      for (const previous of older) {
-        this.markDeleted(previous.row_id, "superseded", now);
-      }
+      this.ctx.storage.sql.exec(
+        "UPDATE snapshots SET state = 'deleted', deleted_at = ?, reason = 'superseded' WHERE name = ? AND image_ref = ? AND state = 'ready' AND row_id < ?",
+        now,
+        row.name,
+        row.image_ref,
+        row.row_id,
+      );
       this.ctx.storage.sql.exec(
         "UPDATE snapshots SET state = 'ready', last_used_at = ? WHERE row_id = ?",
         now,
@@ -162,10 +151,9 @@ export class SnapshotRegistry extends DurableObject {
         row_id: number;
         snapshot_id: string;
         size: number;
-        snapshot_name: string;
         last_used_at: number;
       }>(
-        "SELECT row_id, snapshot_id, size, snapshot_name, last_used_at FROM snapshots WHERE name = ? AND image_ref = ? AND state = 'ready' ORDER BY row_id DESC LIMIT 1",
+        "SELECT row_id, snapshot_id, size, last_used_at FROM snapshots WHERE name = ? AND image_ref = ? AND state = 'ready' ORDER BY row_id DESC LIMIT 1",
         name,
         imageRef,
       )
@@ -183,7 +171,7 @@ export class SnapshotRegistry extends DurableObject {
       now,
       row.row_id,
     );
-    return { id: row.snapshot_id, size: row.size, name: row.snapshot_name };
+    return { id: row.snapshot_id, size: row.size, name };
   }
 
   restoreFailed(snapshotId: string): void {
@@ -193,13 +181,5 @@ export class SnapshotRegistry extends DurableObject {
       now,
       snapshotId,
     );
-  }
-
-  list(): Array<Record<string, unknown>> {
-    return this.ctx.storage.sql
-      .exec(
-        "SELECT name, state, job_id, snapshot_id, size, created_at, last_used_at, deleted_at, reason FROM snapshots ORDER BY row_id DESC LIMIT 50",
-      )
-      .toArray();
   }
 }

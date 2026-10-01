@@ -1,13 +1,13 @@
-export const INSTANCE_PRESETS = [
+const INSTANCE_PRESETS = [
   "standard-1",
   "standard-2",
   "standard-3",
   "standard-4",
 ] as const;
 
-export type InstancePreset = (typeof INSTANCE_PRESETS)[number];
+type InstancePreset = (typeof INSTANCE_PRESETS)[number];
 
-export interface CustomInstance {
+interface CustomInstance {
   vcpu: number;
   memoryMib: number;
   diskMb: number;
@@ -15,9 +15,9 @@ export interface CustomInstance {
 
 export type InstanceSpec = InstancePreset | CustomInstance;
 
-export const DEFAULT_INSTANCE: InstancePreset = "standard-1";
+const DEFAULT_INSTANCE: InstancePreset = "standard-1";
 
-export const CUSTOM_INSTANCE_LIMITS = {
+const CUSTOM_INSTANCE_LIMITS = {
   minVcpu: 1,
   maxVcpu: 4,
   minMemoryGibPerVcpu: 3,
@@ -25,13 +25,13 @@ export const CUSTOM_INSTANCE_LIMITS = {
   maxDiskGb: 20,
 } as const;
 
-export interface LabelContext {
+interface LabelContext {
   prefix: string;
   runId: number;
   runAttempt: number;
 }
 
-export type ParsedLabels =
+type ParsedLabels =
   | { matched: false }
   | { matched: true; error: string }
   | {

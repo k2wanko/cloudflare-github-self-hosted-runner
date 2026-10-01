@@ -2,6 +2,7 @@ import { verifyWebhookSignature } from "./github/webhook-signature.ts";
 import { jobIdFromRunnerName } from "./job-state.ts";
 import { parseLabels } from "./label-parser.ts";
 import { isAllowedOwner, parseAllowedOwners } from "./setup/manifest.ts";
+import { SETUP_INSTANCE } from "./setup/setup-do.ts";
 
 interface WorkflowJobPayload {
   action: string;
@@ -31,13 +32,14 @@ export async function handleWebhook(
   env: Env,
   ctx: ExecutionContext,
 ): Promise<Response> {
-  const credentials =
-    await ctx.exports.Setup.getByName("singleton").getCredentials();
+  const [credentials, body] = await Promise.all([
+    ctx.exports.Setup.getByName(SETUP_INSTANCE).getCredentials(),
+    request.text(),
+  ]);
   if (!credentials) {
     return json({ error: "not configured" }, 503);
   }
 
-  const body = await request.text();
   const valid = await verifyWebhookSignature(
     credentials.webhookSecret,
     body,
@@ -106,9 +108,7 @@ export async function handleWebhook(
       return json({ completed: targetJobId });
     }
     if (job.runner_name === null) {
-      await jobs
-        .getByName(String(job.id))
-        .markCompleted(job.conclusion ?? "cancelled");
+      await jobs.getByName(String(job.id)).markCompleted(job.conclusion);
       return json({ cancelled: job.id });
     }
   }

@@ -1,10 +1,10 @@
-import type { GitHubApiOptions } from "./app-auth.ts";
+import { GITHUB_API, githubHeaders } from "./api.ts";
 
 export type RunnerScope =
   | { kind: "org"; org: string }
   | { kind: "repo"; owner: string; repo: string };
 
-export interface JitRunner {
+interface JitRunner {
   runnerId: number;
   encodedJitConfig: string;
 }
@@ -17,26 +17,17 @@ function scopePath(scope: RunnerScope): string {
     : `/repos/${encodeURIComponent(scope.owner)}/${encodeURIComponent(scope.repo)}`;
 }
 
-function headers(token: string, options: GitHubApiOptions): HeadersInit {
-  return {
-    Authorization: `Bearer ${token}`,
-    Accept: "application/vnd.github+json",
-    "User-Agent": options.userAgent,
-  };
-}
-
 export async function generateJitConfig(
   installationToken: string,
   scope: RunnerScope,
   runnerName: string,
   labels: readonly string[],
-  options: GitHubApiOptions,
 ): Promise<JitRunner> {
   const response = await fetch(
-    `${options.apiBase ?? "https://api.github.com"}${scopePath(scope)}/actions/runners/generate-jitconfig`,
+    `${GITHUB_API}${scopePath(scope)}/actions/runners/generate-jitconfig`,
     {
       method: "POST",
-      headers: headers(installationToken, options),
+      headers: githubHeaders(installationToken),
       body: JSON.stringify({
         name: runnerName,
         runner_group_id: DEFAULT_RUNNER_GROUP_ID,
@@ -63,11 +54,10 @@ export async function deleteRunner(
   installationToken: string,
   scope: RunnerScope,
   runnerId: number,
-  options: GitHubApiOptions,
 ): Promise<void> {
   const response = await fetch(
-    `${options.apiBase ?? "https://api.github.com"}${scopePath(scope)}/actions/runners/${runnerId}`,
-    { method: "DELETE", headers: headers(installationToken, options) },
+    `${GITHUB_API}${scopePath(scope)}/actions/runners/${runnerId}`,
+    { method: "DELETE", headers: githubHeaders(installationToken) },
   );
   if (!response.ok && response.status !== 404) {
     throw new Error(`delete runner failed: ${response.status}`);

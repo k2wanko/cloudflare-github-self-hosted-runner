@@ -1,14 +1,16 @@
 import { DurableObject } from "cloudflare:workers";
+import { GITHUB_API, githubHeaders } from "../github/api.ts";
 import { isAllowedOwner, type OwnerKind } from "./manifest.ts";
 
 const STATE_TTL_MS = 10 * 60 * 1000;
 
-export interface AppCredentials {
+export const SETUP_INSTANCE = "singleton";
+
+interface AppCredentials {
   appId: number;
   slug: string;
   pem: string;
   webhookSecret: string;
-  ownerLogin: string;
 }
 
 interface PendingState {
@@ -24,7 +26,7 @@ interface ManifestConversion {
   owner: { login: string };
 }
 
-export type SetupResult =
+type SetupResult =
   | { ok: true; slug: string }
   | { ok: false; status: number; message: string };
 
@@ -43,11 +45,8 @@ export class Setup extends DurableObject {
     return (await this.ctx.storage.get<AppCredentials>("credentials")) ?? null;
   }
 
-  async getPublicStatus(): Promise<{ configured: boolean; slug?: string }> {
-    const credentials = await this.getCredentials();
-    return credentials
-      ? { configured: true, slug: credentials.slug }
-      : { configured: false };
+  async getSlug(): Promise<string | null> {
+    return (await this.getCredentials())?.slug ?? null;
   }
 
   async begin(ownerKind: OwnerKind): Promise<string> {
@@ -64,7 +63,6 @@ export class Setup extends DurableObject {
     code: string,
     state: string,
     allowedOwners: readonly string[],
-    userAgent: string,
   ): Promise<SetupResult> {
     if (await this.getCredentials()) {
       return { ok: false, status: 409, message: "already configured" };
@@ -78,14 +76,8 @@ export class Setup extends DurableObject {
     }
 
     const response = await fetch(
-      `https://api.github.com/app-manifests/${encodeURIComponent(code)}/conversions`,
-      {
-        method: "POST",
-        headers: {
-          Accept: "application/vnd.github+json",
-          "User-Agent": userAgent,
-        },
-      },
+      `${GITHUB_API}/app-manifests/${encodeURIComponent(code)}/conversions`,
+      { method: "POST", headers: githubHeaders() },
     );
     if (!response.ok) {
       return {
@@ -109,7 +101,6 @@ export class Setup extends DurableObject {
       slug: conversion.slug,
       pem: conversion.pem,
       webhookSecret: conversion.webhook_secret,
-      ownerLogin: conversion.owner.login,
     });
     return { ok: true, slug: conversion.slug };
   }

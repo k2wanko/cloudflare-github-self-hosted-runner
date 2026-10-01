@@ -1,31 +1,27 @@
 import { DurableObject } from "cloudflare:workers";
-import {
-  createAppJwt,
-  type GitHubApiOptions,
-  getInstallationToken,
-} from "./github/app-auth.ts";
+import { createAppJwt, getInstallationToken } from "./github/app-auth.ts";
 import {
   deleteRunner,
   generateJitConfig,
   type RunnerScope,
 } from "./github/jit.ts";
+import { fetchWorkflowRun } from "./github/workflow-run.ts";
 import { type JobRecord, runnerNameFor } from "./job-state.ts";
+import { SETUP_INSTANCE } from "./setup/setup-do.ts";
 import {
   canCreateSnapshot,
   canRestoreSnapshot,
   isForkRun,
   isRestoreNotFound,
-  type WorkflowRunInfo,
 } from "./snapshot-policy.ts";
 import type { SnapshotHandle } from "./snapshot-registry.ts";
 
 const JOB_TIME_LIMIT_MS = 6 * 60 * 60 * 1000;
 const RESTORE_CHECK_MS = 4000;
-const API_OPTIONS: GitHubApiOptions = { userAgent: "cfrunner" };
 
-export type DispatchInput = Omit<JobRecord, "phase" | "runnerId" | "rejected">;
+type DispatchInput = Omit<JobRecord, "phase" | "rejected">;
 
-export interface SnapshotResponse {
+interface SnapshotResponse {
   status: number;
   body: Record<string, string | number | boolean>;
 }
@@ -38,48 +34,13 @@ function scopeOf(job: JobRecord): RunnerScope {
     : { kind: "repo", owner: job.ownerLogin, repo: job.repo };
 }
 
-function imageRefOf(image: unknown): string {
-  return JSON.stringify(image) ?? String(image);
-}
-
-async function fetchRunInfo(
-  token: string,
-  job: JobRecord,
-): Promise<WorkflowRunInfo> {
-  const response = await fetch(
-    `https://api.github.com/repos/${job.repositoryFullName}/actions/runs/${job.runId}`,
-    {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/vnd.github+json",
-        "User-Agent": API_OPTIONS.userAgent,
-      },
-    },
-  );
-  if (!response.ok) {
-    throw new Error(`workflow run lookup failed: ${response.status}`);
-  }
-  const run = (await response.json()) as {
-    event: string;
-    head_branch: string | null;
-    head_repository: { full_name: string } | null;
-  };
-  return {
-    event: run.event,
-    headBranch: run.head_branch,
-    headRepositoryFullName: run.head_repository?.full_name ?? null,
-    repositoryFullName: job.repositoryFullName,
-    defaultBranch: job.defaultBranch,
-  };
-}
-
 export class RunnerJob extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
       const job = await this.load();
       if (job && ctx.container?.running) {
-        await this.armContainer(ctx.container, job);
+        await this.prepareRunningContainer(ctx.container, job);
       }
     });
   }
@@ -92,9 +53,8 @@ export class RunnerJob extends DurableObject<Env> {
     return container;
   }
 
-  private registry() {
-    return (job: JobRecord) =>
-      this.ctx.exports.SnapshotRegistry.getByName(job.repositoryFullName);
+  private registry(job: JobRecord) {
+    return this.ctx.exports.SnapshotRegistry.getByName(job.repositoryFullName);
   }
 
   private async load(): Promise<JobRecord | undefined> {
@@ -105,7 +65,7 @@ export class RunnerJob extends DurableObject<Env> {
     await this.ctx.storage.put("job", job);
   }
 
-  private async armContainer(
+  private async prepareRunningContainer(
     container: ContainerHandle,
     job: JobRecord,
   ): Promise<void> {
@@ -138,10 +98,12 @@ export class RunnerJob extends DurableObject<Env> {
       return;
     }
     await this.save({ ...job, phase: "completed" });
-    await this.registry()(job).promote(job.jobId, conclusion === "success");
-    if (this.container.running) {
-      await this.container.destroy("job completed");
-    }
+    await Promise.all([
+      this.registry(job).promote(job.jobId, conclusion === "success"),
+      this.container.running
+        ? this.container.destroy("job completed")
+        : undefined,
+    ]);
   }
 
   async createSnapshot(): Promise<SnapshotResponse> {
@@ -159,7 +121,7 @@ export class RunnerJob extends DurableObject<Env> {
       };
     }
 
-    const registry = this.registry()(job);
+    const registry = this.registry(job);
     await registry.reserve(job.snapshot, job.imageRef, job.jobId);
 
     try {
@@ -187,9 +149,8 @@ export class RunnerJob extends DurableObject<Env> {
   }
 
   private async startRunnerOrFail(): Promise<void> {
-    const cleanup: { token?: string; runnerId?: number } = {};
     try {
-      await this.startRunner(cleanup);
+      await this.startRunner();
     } catch (error) {
       const job = await this.load();
       console.error("runner start failed", job?.jobId, String(error));
@@ -199,22 +160,11 @@ export class RunnerJob extends DurableObject<Env> {
           phase: "completed",
           rejected: String(error),
         });
-        if (cleanup.token && cleanup.runnerId !== undefined) {
-          await deleteRunner(
-            cleanup.token,
-            scopeOf(job),
-            cleanup.runnerId,
-            API_OPTIONS,
-          ).catch(() => undefined);
-        }
       }
     }
   }
 
-  private async startRunner(cleanup: {
-    token?: string;
-    runnerId?: number;
-  }): Promise<void> {
+  private async startRunner(): Promise<void> {
     const job = await this.load();
     if (!job || job.phase !== "dispatched") {
       return;
@@ -222,34 +172,32 @@ export class RunnerJob extends DurableObject<Env> {
     await this.save({ ...job, phase: "starting" });
 
     const credentials =
-      await this.ctx.exports.Setup.getByName("singleton").getCredentials();
+      await this.ctx.exports.Setup.getByName(SETUP_INSTANCE).getCredentials();
     if (!credentials) {
       throw new Error("setup is not completed");
     }
 
-    const appJwt = await createAppJwt(credentials.appId, credentials.pem);
     const token = await getInstallationToken(
-      appJwt,
+      await createAppJwt(credentials.appId, credentials.pem),
       job.installationId,
-      API_OPTIONS,
     );
 
-    cleanup.token = token;
-
     console.log("job", job.jobId, "fetching run info");
-    const run = await fetchRunInfo(token, job);
+    const run = await fetchWorkflowRun(
+      token,
+      job.repositoryFullName,
+      job.runId,
+      job.defaultBranch,
+    );
     if (isForkRun(run)) {
       await this.save({ ...job, phase: "completed", rejected: "fork" });
       return;
     }
 
-    const images = this.container.images as Record<string, unknown>;
-    const image = images[job.image];
+    const image = this.container.images[job.image];
     if (!image) {
       throw new Error(`unknown image: ${job.image}`);
     }
-    const imageRef = imageRefOf(image);
-    const allowCreate = canCreateSnapshot(run);
     const allowRestore = canRestoreSnapshot(
       run,
       this.env.SNAPSHOT_RESTORE_ANY_REF === "true",
@@ -261,60 +209,61 @@ export class RunnerJob extends DurableObject<Env> {
       scopeOf(job),
       runnerNameFor(job.jobId, job.attempt),
       job.labels,
-      API_OPTIONS,
     );
 
-    cleanup.runnerId = jit.runnerId;
+    try {
+      const latest = await this.load();
+      if (!latest || latest.phase === "completed") {
+        await deleteRunner(token, scopeOf(job), jit.runnerId);
+        return;
+      }
+      await this.save({
+        ...latest,
+        imageRef: image,
+        allowCreate: canCreateSnapshot(run),
+      });
 
-    const latest = await this.load();
-    if (!latest || latest.phase === "completed") {
-      await deleteRunner(token, scopeOf(job), jit.runnerId, API_OPTIONS);
-      return;
-    }
-    await this.save({
-      ...latest,
-      phase: "starting",
-      runnerId: jit.runnerId,
-      imageRef,
-      allowCreate,
-    });
+      const registry = this.registry(job);
+      let handle: SnapshotHandle | null = null;
+      if (job.snapshot && allowRestore) {
+        handle = await registry.resolve(job.snapshot, image);
+        console.log(
+          "job",
+          job.jobId,
+          "snapshot",
+          job.snapshot,
+          handle ? "hit" : "miss",
+        );
+      }
 
-    let handle: SnapshotHandle | null = null;
-    if (job.snapshot && allowRestore) {
-      handle = await this.registry()(job).resolve(job.snapshot, imageRef);
-      console.log(
-        "job",
-        job.jobId,
-        "snapshot",
-        job.snapshot,
-        handle ? "hit" : "miss",
+      console.log("job", job.jobId, "starting container");
+      const started = await this.startContainer(
+        latest,
+        image,
+        jit.encodedJitConfig,
+        handle,
       );
-    }
-
-    console.log("job", job.jobId, "starting container");
-    const started = await this.startContainer(
-      latest,
-      image,
-      jit.encodedJitConfig,
-      handle,
-    );
-    if (started === "restore-not-found" && handle) {
-      await this.registry()(job).restoreFailed(handle.id);
-      await this.startContainer(latest, image, jit.encodedJitConfig, null);
+      if (started === "restore-not-found" && handle) {
+        await registry.restoreFailed(handle.id);
+        await this.startContainer(latest, image, jit.encodedJitConfig, null);
+      }
+    } catch (error) {
+      await deleteRunner(token, scopeOf(job), jit.runnerId).catch(
+        () => undefined,
+      );
+      throw error;
     }
   }
 
   private async startContainer(
     job: JobRecord,
-    image: unknown,
+    image: string,
     jitConfig: string,
     snapshot: SnapshotHandle | null,
   ): Promise<"ok" | "restore-not-found"> {
     const container = this.container;
     container.start({
-      ...(snapshot
-        ? { containerSnapshot: snapshot }
-        : { image: image as never }),
+      ...(snapshot ? { containerSnapshot: snapshot } : { image }),
       instance: job.instance,
       enableInternet: true,
       env: {
@@ -323,7 +272,7 @@ export class RunnerJob extends DurableObject<Env> {
         CFRUNNER_SNAPSHOT_HIT: snapshot ? "true" : "false",
       },
     });
-    await this.armContainer(container, job);
+    await this.prepareRunningContainer(container, job);
 
     const exit = container.monitor().then(
       () => undefined,

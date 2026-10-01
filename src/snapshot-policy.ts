@@ -6,7 +6,7 @@ export interface WorkflowRunInfo {
   defaultBranch: string;
 }
 
-export const SNAPSHOT_CREATE_EVENTS = [
+const SNAPSHOT_CREATE_EVENTS = [
   "push",
   "workflow_dispatch",
   "schedule",
@@ -40,10 +40,6 @@ export const PENDING_RESERVATION_TTL_MS = 7 * 60 * 60 * 1000;
 
 export function isExpired(lastUsedAt: number, now: number): boolean {
   return now - lastUsedAt > SNAPSHOT_RETENTION_MS;
-}
-
-export function isStalePending(createdAt: number, now: number): boolean {
-  return now - createdAt > PENDING_RESERVATION_TTL_MS;
 }
 
 export function isRestoreNotFound(error: unknown): boolean {

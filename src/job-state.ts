@@ -1,6 +1,6 @@
 import type { InstanceSpec } from "./label-parser.ts";
 
-export type JobPhase = "dispatched" | "starting" | "started" | "completed";
+type JobPhase = "dispatched" | "starting" | "started" | "completed";
 
 export interface JobRecord {
   phase: JobPhase;
@@ -19,11 +19,11 @@ export interface JobRecord {
   snapshot?: string;
   imageRef?: string;
   allowCreate?: boolean;
-  runnerId?: number;
   rejected?: string;
 }
 
-export const RUNNER_NAME_PREFIX = "cf-";
+const RUNNER_NAME_PREFIX = "cf-";
+const RUNNER_NAME_PATTERN = new RegExp(`^${RUNNER_NAME_PREFIX}(\\d+)-\\d+$`);
 
 export function runnerNameFor(jobId: number, attempt: number): string {
   return `${RUNNER_NAME_PREFIX}${jobId}-${attempt}`;
@@ -32,6 +32,6 @@ export function runnerNameFor(jobId: number, attempt: number): string {
 export function jobIdFromRunnerName(
   runnerName: string | null | undefined,
 ): number | undefined {
-  const match = /^cf-(\d+)-\d+$/.exec(runnerName ?? "");
+  const match = RUNNER_NAME_PATTERN.exec(runnerName ?? "");
   return match?.[1] ? Number(match[1]) : undefined;
 }

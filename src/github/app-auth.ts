@@ -1,3 +1,5 @@
+import { GITHUB_API, githubHeaders } from "./api.ts";
+
 const PKCS8_RSA_HEADER = Uint8Array.from([
   0x30, 0x82, 0x00, 0x00, 0x02, 0x01, 0x00, 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86,
   0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00, 0x04, 0x82, 0x00, 0x00,
@@ -73,26 +75,13 @@ export async function createAppJwt(
   return `${header}.${payload}.${base64UrlEncode(new Uint8Array(signature))}`;
 }
 
-export interface GitHubApiOptions {
-  apiBase?: string;
-  userAgent: string;
-}
-
 export async function getInstallationToken(
   appJwt: string,
   installationId: number,
-  options: GitHubApiOptions,
 ): Promise<string> {
   const response = await fetch(
-    `${options.apiBase ?? "https://api.github.com"}/app/installations/${installationId}/access_tokens`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${appJwt}`,
-        Accept: "application/vnd.github+json",
-        "User-Agent": options.userAgent,
-      },
-    },
+    `${GITHUB_API}/app/installations/${installationId}/access_tokens`,
+    { method: "POST", headers: githubHeaders(appJwt) },
   );
   if (!response.ok) {
     throw new Error(`installation token request failed: ${response.status}`);

@@ -73,13 +73,16 @@ export function manifestRedirectPage(
   );
 }
 
+export function installUrl(slug: string): string {
+  return `https://github.com/apps/${encodeURIComponent(slug)}/installations/new`;
+}
+
 export function configuredPage(slug: string, labelPrefix: string): string {
-  const installUrl = `https://github.com/apps/${encodeURIComponent(slug)}/installations/new`;
   return layout(
     "Runner is configured",
     `<h1>Runner is configured</h1>
 <p>GitHub App: <code>${escapeHtml(slug)}</code></p>
-<p><a href="${escapeHtml(installUrl)}">Install the App on repositories</a></p>
+<p><a href="${escapeHtml(installUrl(slug))}">Install the App on repositories</a></p>
 <h2>Usage</h2>
 <pre>runs-on:
   - ${escapeHtml(labelPrefix)}-\${{ github.run_id }}-\${{ github.run_attempt }}

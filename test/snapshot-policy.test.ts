@@ -5,8 +5,6 @@ import {
   isExpired,
   isForkRun,
   isRestoreNotFound,
-  isStalePending,
-  PENDING_RESERVATION_TTL_MS,
   SNAPSHOT_RETENTION_MS,
   type WorkflowRunInfo,
 } from "../src/snapshot-policy.ts";
@@ -52,11 +50,9 @@ describe("snapshot policy", () => {
     expect(canRestoreSnapshot(base, false)).toBe(true);
   });
 
-  test("expiry and stale reservations use fixed windows", () => {
+  test("expiry uses a fixed retention window", () => {
     expect(isExpired(0, SNAPSHOT_RETENTION_MS)).toBe(false);
     expect(isExpired(0, SNAPSHOT_RETENTION_MS + 1)).toBe(true);
-    expect(isStalePending(0, PENDING_RESERVATION_TTL_MS)).toBe(false);
-    expect(isStalePending(0, PENDING_RESERVATION_TTL_MS + 1)).toBe(true);
   });
 
   test("recognises the missing-snapshot error from the runtime", () => {

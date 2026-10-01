@@ -1,6 +1,6 @@
 export type OwnerKind = "user" | "org";
 
-export interface ManifestInput {
+interface ManifestInput {
   origin: string;
   appName: string;
   ownerKind: OwnerKind;

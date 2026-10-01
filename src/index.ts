@@ -6,11 +6,13 @@ import {
 import {
   configuredPage,
   html,
+  installUrl,
   manifestRedirectPage,
   messagePage,
   parseOwnerKind,
   setupWizardPage,
 } from "./setup/page.ts";
+import { SETUP_INSTANCE } from "./setup/setup-do.ts";
 import { handleWebhook } from "./webhook.ts";
 
 export { Control } from "./control.ts";
@@ -18,15 +20,13 @@ export { RunnerJob } from "./runner-job.ts";
 export { Setup } from "./setup/setup-do.ts";
 export { SnapshotRegistry } from "./snapshot-registry.ts";
 
-const USER_AGENT = "cfrunner";
-
 async function handleSetup(
   request: Request,
   env: Env,
   ctx: ExecutionContext,
 ): Promise<Response> {
   const url = new URL(request.url);
-  const setup = ctx.exports.Setup.getByName("singleton");
+  const setup = ctx.exports.Setup.getByName(SETUP_INSTANCE);
 
   if (url.pathname === "/setup/reset") {
     const token = env.SETUP_RESET_TOKEN;
@@ -41,8 +41,7 @@ async function handleSetup(
     );
   }
 
-  const status = await setup.getPublicStatus();
-  if (status.configured) {
+  if (await setup.getSlug()) {
     return messagePage("Already configured", "Setup cannot be changed.", 409);
   }
 
@@ -81,15 +80,11 @@ async function handleSetup(
       code,
       state,
       parseAllowedOwners(env.ALLOWED_OWNERS),
-      USER_AGENT,
     );
     if (!result.ok) {
       return messagePage("Setup failed", result.message, result.status);
     }
-    return Response.redirect(
-      `https://github.com/apps/${encodeURIComponent(result.slug)}/installations/new`,
-      302,
-    );
+    return Response.redirect(installUrl(result.slug), 302);
   }
 
   return new Response("not found", { status: 404 });
@@ -106,12 +101,9 @@ export default {
       return handleSetup(request, env, ctx);
     }
     if (url.pathname === "/" && request.method === "GET") {
-      const status =
-        await ctx.exports.Setup.getByName("singleton").getPublicStatus();
+      const slug = await ctx.exports.Setup.getByName(SETUP_INSTANCE).getSlug();
       return html(
-        status.configured && status.slug
-          ? configuredPage(status.slug, env.LABEL_PREFIX)
-          : setupWizardPage(),
+        slug ? configuredPage(slug, env.LABEL_PREFIX) : setupWizardPage(),
       );
     }
     return new Response("not found", { status: 404 });
