@@ -79,7 +79,7 @@ steps:
 ```
 
 - `CFRUNNER_SNAPSHOT_HIT` and `CFRUNNER_ENDPOINT` are environment variables of the runner process. They are not in the `env` context, so pass them through a step output as above.
-- Snapshots are immutable. A name that already exists is kept (`created: false`). Change the name (`-v2`) to refresh.
+- Every call creates a new snapshot. When the job succeeds, the snapshot reserved last replaces the earlier ones with the same name; until then the previous snapshot keeps being used. A snapshot from a failed or cancelled job is discarded.
 - A new snapshot becomes available **after the job completes successfully**. It is never visible to jobs that are still running, and a failed or cancelled job discards it. This keeps the job's `GITHUB_TOKEN` out of reach.
 - Snapshots can only be created by runs of the default branch started by `push`, `workflow_dispatch` or `schedule`. Other refs can neither create nor restore them unless `SNAPSHOT_RESTORE_ANY_REF=true` (restore only).
 - Snapshots belong to one repository and one image. Updating the image invalidates them. They expire 30 days after the last use.

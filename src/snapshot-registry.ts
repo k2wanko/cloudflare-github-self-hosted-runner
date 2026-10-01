@@ -7,8 +7,6 @@ export interface SnapshotHandle {
   name: string;
 }
 
-export type ReserveResult = "reserved" | "exists" | "pending";
-
 const DELETED_ROW_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 
 type DeleteReason =
@@ -55,26 +53,19 @@ export class SnapshotRegistry extends DurableObject {
     );
   }
 
-  reserve(name: string, imageRef: string, jobId: number): ReserveResult {
+  reserve(name: string, imageRef: string, jobId: number): void {
     const now = Date.now();
     this.purgeOldDeletedRows(now);
 
-    const existing = this.ctx.storage.sql
-      .exec<{ row_id: number; state: string; created_at: number }>(
-        "SELECT row_id, state, created_at FROM snapshots WHERE name = ? AND image_ref = ? AND state IN ('ready', 'pending')",
-        name,
-        imageRef,
+    const stale = this.ctx.storage.sql
+      .exec<{ row_id: number; created_at: number }>(
+        "SELECT row_id, created_at FROM snapshots WHERE state = 'pending'",
       )
       .toArray();
-
-    for (const row of existing) {
-      if (row.state === "ready") {
-        return "exists";
+    for (const row of stale) {
+      if (isStalePending(row.created_at, now)) {
+        this.markDeleted(row.row_id, "stale_pending", now);
       }
-      if (!isStalePending(row.created_at, now)) {
-        return "pending";
-      }
-      this.markDeleted(row.row_id, "stale_pending", now);
     }
 
     this.ctx.storage.sql.exec(
@@ -85,7 +76,6 @@ export class SnapshotRegistry extends DurableObject {
       now,
       now,
     );
-    return "reserved";
   }
 
   attach(
@@ -95,7 +85,7 @@ export class SnapshotRegistry extends DurableObject {
     handle: SnapshotHandle,
   ): void {
     this.ctx.storage.sql.exec(
-      "UPDATE snapshots SET snapshot_id = ?, size = ?, snapshot_name = ? WHERE name = ? AND image_ref = ? AND job_id = ? AND state = 'pending'",
+      "UPDATE snapshots SET snapshot_id = ?, size = ?, snapshot_name = ? WHERE row_id = (SELECT MAX(row_id) FROM snapshots WHERE name = ? AND image_ref = ? AND job_id = ? AND state = 'pending')",
       handle.id,
       handle.size,
       handle.name,
@@ -107,7 +97,7 @@ export class SnapshotRegistry extends DurableObject {
 
   abandon(name: string, imageRef: string, jobId: number): void {
     this.ctx.storage.sql.exec(
-      "UPDATE snapshots SET state = 'deleted', deleted_at = ?, reason = 'job_failed' WHERE name = ? AND image_ref = ? AND job_id = ? AND state = 'pending'",
+      "UPDATE snapshots SET state = 'deleted', deleted_at = ?, reason = 'job_failed' WHERE row_id = (SELECT MAX(row_id) FROM snapshots WHERE name = ? AND image_ref = ? AND job_id = ? AND state = 'pending' AND snapshot_id IS NULL)",
       Date.now(),
       name,
       imageRef,
@@ -124,7 +114,7 @@ export class SnapshotRegistry extends DurableObject {
         image_ref: string;
         snapshot_id: string | null;
       }>(
-        "SELECT row_id, name, image_ref, snapshot_id FROM snapshots WHERE job_id = ? AND state = 'pending'",
+        "SELECT row_id, name, image_ref, snapshot_id FROM snapshots WHERE job_id = ? AND state = 'pending' ORDER BY row_id",
         jobId,
       )
       .toArray();
@@ -134,11 +124,24 @@ export class SnapshotRegistry extends DurableObject {
         this.markDeleted(row.row_id, "job_failed", now);
         continue;
       }
-      const older = this.ctx.storage.sql
+      const newer = this.ctx.storage.sql
         .exec<{ row_id: number }>(
-          "SELECT row_id FROM snapshots WHERE name = ? AND image_ref = ? AND state = 'ready'",
+          "SELECT row_id FROM snapshots WHERE name = ? AND image_ref = ? AND state = 'ready' AND row_id > ?",
           row.name,
           row.image_ref,
+          row.row_id,
+        )
+        .toArray();
+      if (newer.length > 0) {
+        this.markDeleted(row.row_id, "superseded", now);
+        continue;
+      }
+      const older = this.ctx.storage.sql
+        .exec<{ row_id: number }>(
+          "SELECT row_id FROM snapshots WHERE name = ? AND image_ref = ? AND state = 'ready' AND row_id < ?",
+          row.name,
+          row.image_ref,
+          row.row_id,
         )
         .toArray();
       for (const previous of older) {

@@ -32,7 +32,6 @@ jobs:
           node-version: 24
       - run: bun install --frozen-lockfile
       - name: create snapshot
-        if: steps.snap.outputs.hit != 'true'
         run: curl -fsS -X POST "$CFRUNNER_ENDPOINT/snapshot" || true
       - run: bun run lint
       - run: bun run typecheck

@@ -160,17 +160,7 @@ export class RunnerJob extends DurableObject<Env> {
     }
 
     const registry = this.registry()(job);
-    const reserved = await registry.reserve(
-      job.snapshot,
-      job.imageRef,
-      job.jobId,
-    );
-    if (reserved !== "reserved") {
-      return {
-        status: 200,
-        body: { created: false, reason: reserved, name: job.snapshot },
-      };
-    }
+    await registry.reserve(job.snapshot, job.imageRef, job.jobId);
 
     try {
       const handle = await this.container.snapshotContainer({
