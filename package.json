@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "lint": "biome check .",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "cf workers types && tsc --noEmit",
     "test": "bun test"
   },
   "devDependencies": {
