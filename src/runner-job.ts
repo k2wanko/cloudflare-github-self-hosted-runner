@@ -94,10 +94,12 @@ export class RunnerJob extends DurableObject<Env> {
 
   async markCompleted(conclusion: string | null): Promise<void> {
     const job = await this.load();
-    if (!job || job.phase === "completed") {
+    if (!job) {
       return;
     }
-    await this.save({ ...job, phase: "completed" });
+    if (job.phase !== "completed") {
+      await this.save({ ...job, phase: "completed" });
+    }
     await Promise.all([
       this.registry(job).promote(job.jobId, conclusion === "success"),
       this.container.running
@@ -212,17 +214,6 @@ export class RunnerJob extends DurableObject<Env> {
     );
 
     try {
-      const latest = await this.load();
-      if (!latest || latest.phase === "completed") {
-        await deleteRunner(token, scopeOf(job), jit.runnerId);
-        return;
-      }
-      await this.save({
-        ...latest,
-        imageRef: image,
-        allowCreate: canCreateSnapshot(run),
-      });
-
       const registry = this.registry(job);
       let handle: SnapshotHandle | null = null;
       if (job.snapshot && allowRestore) {
@@ -236,14 +227,26 @@ export class RunnerJob extends DurableObject<Env> {
         );
       }
 
+      const latest = await this.load();
+      if (!latest || latest.phase === "completed") {
+        await deleteRunner(token, scopeOf(job), jit.runnerId);
+        return;
+      }
+      await this.save({
+        ...latest,
+        imageRef: image,
+        allowCreate: canCreateSnapshot(run),
+      });
+
       console.log("job", job.jobId, "starting container");
-      const started = await this.startContainer(
+      const first = await this.startContainer(
         latest,
         image,
         jit.encodedJitConfig,
         handle,
       );
-      if (started === "restore-not-found" && handle) {
+      if (handle && first.restoreNotFound) {
+        await first.exitHandled;
         await registry.restoreFailed(handle.id);
         await this.startContainer(latest, image, jit.encodedJitConfig, null);
       }
@@ -260,7 +263,7 @@ export class RunnerJob extends DurableObject<Env> {
     image: string,
     jitConfig: string,
     snapshot: SnapshotHandle | null,
-  ): Promise<"ok" | "restore-not-found"> {
+  ): Promise<{ restoreNotFound: boolean; exitHandled: Promise<void> }> {
     const container = this.container;
     container.start({
       ...(snapshot ? { containerSnapshot: snapshot } : { image }),
@@ -279,20 +282,19 @@ export class RunnerJob extends DurableObject<Env> {
       (error: unknown) => error,
     );
     const startedAt = Date.now();
-    this.ctx.waitUntil(
-      exit.then(async (reason) => {
-        console.log(
-          "container exited",
-          job.jobId,
-          `after ${Date.now() - startedAt}ms`,
-          reason === undefined ? "cleanly" : String(reason),
-        );
-        await container.destroy("container exited").catch(() => undefined);
-      }),
-    );
+    const exitHandled = exit.then(async (reason) => {
+      console.log(
+        "container exited",
+        job.jobId,
+        `after ${Date.now() - startedAt}ms`,
+        reason === undefined ? "cleanly" : String(reason),
+      );
+      await container.destroy("container exited").catch(() => undefined);
+    });
+    this.ctx.waitUntil(exitHandled);
 
     if (!snapshot) {
-      return "ok";
+      return { restoreNotFound: false, exitHandled };
     }
     const early = await Promise.race([
       exit,
@@ -300,8 +302,9 @@ export class RunnerJob extends DurableObject<Env> {
         setTimeout(() => resolve(undefined), RESTORE_CHECK_MS),
       ),
     ]);
-    return early !== undefined && isRestoreNotFound(early)
-      ? "restore-not-found"
-      : "ok";
+    return {
+      restoreNotFound: early !== undefined && isRestoreNotFound(early),
+      exitHandled,
+    };
   }
 }
