@@ -121,7 +121,7 @@ export class RunnerJob extends DurableObject<Env> {
       return "duplicate";
     }
     await this.save({ ...input, phase: "dispatched" });
-    this.ctx.waitUntil(this.startRunner());
+    this.ctx.waitUntil(this.startRunnerOrFail());
     return "accepted";
   }
 
@@ -196,7 +196,35 @@ export class RunnerJob extends DurableObject<Env> {
     }
   }
 
-  private async startRunner(): Promise<void> {
+  private async startRunnerOrFail(): Promise<void> {
+    const cleanup: { token?: string; runnerId?: number } = {};
+    try {
+      await this.startRunner(cleanup);
+    } catch (error) {
+      const job = await this.load();
+      console.error("runner start failed", job?.jobId, String(error));
+      if (job) {
+        await this.save({
+          ...job,
+          phase: "completed",
+          rejected: String(error),
+        });
+        if (cleanup.token && cleanup.runnerId !== undefined) {
+          await deleteRunner(
+            cleanup.token,
+            scopeOf(job),
+            cleanup.runnerId,
+            API_OPTIONS,
+          ).catch(() => undefined);
+        }
+      }
+    }
+  }
+
+  private async startRunner(cleanup: {
+    token?: string;
+    runnerId?: number;
+  }): Promise<void> {
     const job = await this.load();
     if (!job || job.phase !== "dispatched") {
       return;
@@ -215,6 +243,8 @@ export class RunnerJob extends DurableObject<Env> {
       job.installationId,
       API_OPTIONS,
     );
+
+    cleanup.token = token;
 
     const run = await fetchRunInfo(token, job);
     if (isForkRun(run)) {
@@ -241,6 +271,8 @@ export class RunnerJob extends DurableObject<Env> {
       job.labels,
       API_OPTIONS,
     );
+
+    cleanup.runnerId = jit.runnerId;
 
     const latest = await this.load();
     if (!latest || latest.phase === "completed") {
